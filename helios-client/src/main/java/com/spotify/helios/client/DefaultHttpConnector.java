@@ -23,6 +23,7 @@ import com.google.common.base.Throwables;
 import com.spotify.helios.common.HeliosException;
 import com.spotify.helios.common.Json;
 
+import org.apache.http.conn.ssl.DefaultHostnameVerifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -36,9 +37,9 @@ import java.net.UnknownHostException;
 import java.util.List;
 import java.util.Map;
 
+import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.HttpsURLConnection;
-
-import static java.net.HttpURLConnection.HTTP_BAD_GATEWAY;
+import javax.net.ssl.SSLSession;
 
 // TODO (mbrown): rename
 public class DefaultHttpConnector implements HttpConnector {
@@ -59,8 +60,10 @@ public class DefaultHttpConnector implements HttpConnector {
                                    final Map<String, List<String>> headers) throws HeliosException {
     // TODO (mbrown): this shouldn't be here
     final Endpoint endpoint = endpointIterator.next();
+    final String endpointHost = endpoint.getUri().getHost();
+
     try {
-      return connect0(uri, method, entity, headers);
+      return connect0(uri, method, entity, headers, endpointHost);
     } catch (ConnectException | SocketTimeoutException | UnknownHostException e) {
       // UnknownHostException happens if we can't resolve hostname into IP address.
       // UnknownHostException's getMessage method returns just the hostname which is a
@@ -73,7 +76,8 @@ public class DefaultHttpConnector implements HttpConnector {
   }
 
   private HttpURLConnection connect0(final URI ipUri, final String method, final byte[] entity,
-                                     final Map<String, List<String>> headers)
+                                     final Map<String, List<String>> headers,
+                                     final String endpointHost)
       throws IOException {
     if (log.isTraceEnabled()) {
       log.trace("req: {} {} {} {} {} {}", method, ipUri, headers.size(),
@@ -84,6 +88,8 @@ public class DefaultHttpConnector implements HttpConnector {
     }
 
     final HttpURLConnection connection = (HttpURLConnection) ipUri.toURL().openConnection();
+    handleHttps(connection, endpointHost);
+
     connection.setRequestProperty("Accept-Encoding", "gzip");
     connection.setInstanceFollowRedirects(false);
     connection.setConnectTimeout(httpTimeoutMillis);
@@ -100,14 +106,30 @@ public class DefaultHttpConnector implements HttpConnector {
 
     setRequestMethod(connection, method, connection instanceof HttpsURLConnection);
 
-    final int responseCode = connection.getResponseCode();
-    if (responseCode == HTTP_BAD_GATEWAY) {
-      throw new ConnectException("502 Bad Gateway");
-    }
-
     return connection;
   }
 
+  private void handleHttps(final HttpURLConnection connection, final String hostname) {
+
+    if (!(connection instanceof HttpsURLConnection)) {
+      return;
+    }
+
+    // We verify the TLS certificate against the original hostname since verifying against the
+    // IP address will fail
+    System.setProperty("sun.net.http.allowRestrictedHeaders", "true");
+    connection.setRequestProperty("Host", hostname);
+
+    final HttpsURLConnection httpsConnection = (HttpsURLConnection) connection;
+    httpsConnection.setHostnameVerifier(new HostnameVerifier() {
+      @Override
+      public boolean verify(String ip, SSLSession sslSession) {
+        final String tHostname =
+            hostname.endsWith(".") ? hostname.substring(0, hostname.length() - 1) : hostname;
+        return new DefaultHostnameVerifier().verify(tHostname, sslSession);
+      }
+    });
+  }
 
   private void setRequestMethod(final HttpURLConnection connection,
                                 final String method,
